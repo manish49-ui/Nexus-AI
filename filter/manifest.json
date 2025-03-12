@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Keyword Blocker",
+  "version": "1.0",
+  "description": "Blur YouTube videos based on keywords and block Shorts buttons and URLs.",
+  "permissions": [
+    "storage",
+    "activeTab"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://www.youtube.com/*"],
+      "js": ["libs/marked.min.js", "content.js"],
+      "run_at": "document_end"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
