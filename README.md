@@ -1,4 +1,4 @@
-# Nexus-AI
+## Nexus-AI
 
 Nexus-AI is an intelligent assessment platform that transforms learning materials into interactive quizzes using AI. Create, take, and analyze assessments from various content formats including YouTube videos, documents, and audio files.
 
