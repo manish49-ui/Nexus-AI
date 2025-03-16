@@ -1,7 +1,12 @@
-import { useState, useRef } from "react"
-import { useNavigate } from "react-router-dom"
-import { FileText, Youtube, Video, Music, FileUp, ChevronDown, Upload, AlertCircle } from "lucide-react"
-import { generateQuizFromYoutube, generateQuizFromMedia, generateQuizFromDocument } from '../../../services/quiz/QuizService';
+import { useState, useRef } from "react";
+import { useNavigate } from "react-router-dom";
+import { FileText, Youtube, Video, Music, FileUp, ChevronDown, Upload, AlertCircle } from "lucide-react";
+import { 
+    generateQuizFromYoutube, 
+    generateQuizFromMedia, 
+    generateQuizFromDocument, 
+    generateQuizFromMediaUrl 
+} from '../../../services/quiz/QuizService';
 
 const GenerateQuiz = () => {
     const [selectedInput, setSelectedInput] = useState(null)
@@ -16,6 +21,10 @@ const GenerateQuiz = () => {
     const [loading, setLoading] = useState(false)
     const fileInputRef = useRef(null)
     const navigate = useNavigate()
+    const [uploadProgress, setUploadProgress] = useState(0);
+    const [isUploading, setIsUploading] = useState(false);
+    const [cloudinaryUrl, setCloudinaryUrl] = useState(null);
+    const [cloudinaryData, setCloudinaryData] = useState(null);
     console.log(loading);
     
 
@@ -110,26 +119,60 @@ const GenerateQuiz = () => {
         setIsQuestionCountDropdownOpen(false)
     }
 
-    const handleFileChange = (e) => {
-        const selectedFile = e.target.files[0]
+    const handleFileChange = async (e) => {
+        const selectedFile = e.target.files[0];
 
         if (selectedFile) {
-        // Check file size (15MB limit)
-        if (selectedFile.size > 15 * 1024 * 1024) {
-            setError("File size exceeds 15MB limit")
-            setFile(null)
-            return
-        }
+            // Check file size (100MB limit for media files, 25MB for documents)
+            const maxSize = selectedInput.id === "document" ? 25 * 1024 * 1024 : 100 * 1024 * 1024;
+            if (selectedFile.size > maxSize) {
+                setError(`File size exceeds ${selectedInput.id === "document" ? "25MB" : "100MB"} limit`);
+                setFile(null);
+                return;
+            }
 
-        setFile(selectedFile)
-        setError("")
+            setFile(selectedFile);
+            setError("");
+            setCloudinaryUrl(null);
+            
+            // If it's a media file and not a document, upload to Cloudinary immediately
+            if ((selectedInput.id === "mp4-local" || selectedInput.id === "mp3-local") && 
+                process.env.REACT_APP_USE_CLOUDINARY === "true") {
+                try {
+                    setIsUploading(true);
+                    setUploadProgress(0);
+                    
+                    // Simulate progress updates every 200ms until we reach 90%
+                    const progressInterval = setInterval(() => {
+                        setUploadProgress(prev => Math.min(prev + 5, 90));
+                    }, 200);
+                    
+                    // Dynamically import cloudinary utils
+                    const { uploadToCloudinary, getResourceType } = await import('../../../utils/cloudinaryUtils');
+                    
+                    // Upload file to Cloudinary
+                    const resourceType = getResourceType(selectedFile);
+                    const uploadResult = await uploadToCloudinary(selectedFile, {
+                        folder: 'assessments/media',
+                        resourceType
+                    });
+                    
+                    // Clear interval and set upload to 100%
+                    clearInterval(progressInterval);
+                    setUploadProgress(100);
+                    setCloudinaryUrl(uploadResult.url);
+                    setCloudinaryData(uploadResult); // Save full result object
+                    
+                    console.log("File uploaded to Cloudinary:", uploadResult.url);
+                } catch (error) {
+                    console.error("Error uploading to Cloudinary:", error);
+                    setError(`Upload failed: ${error.message}. Will use direct upload when generating quiz.`);
+                } finally {
+                    setIsUploading(false);
+                }
+            }
         }
-    }
-    
-    // useEffect(() => {
-    //     const defaultInput = inputTypes.find(input => input.id === "youtube")
-    //     setSelectedInput(defaultInput)
-    // }, [])
+    };
 
     const handleInputChange = (e) => {
         setInputValue(e.target.value)
@@ -137,6 +180,11 @@ const GenerateQuiz = () => {
     }
 
     const handleSubmit = async () => {
+        if (!selectedInput) {
+            setError("Please select an input type");
+            return;
+        }
+
         if (selectedInput.acceptsFile && !file) {
             setError("Please upload a file");
             return;
@@ -162,24 +210,52 @@ const GenerateQuiz = () => {
 
         try {
             let data;
+            
             if (selectedInput.id === "youtube") {
                 data = await generateQuizFromYoutube(inputValue, questionCount.id, difficulty.id);
                 console.log("data", data);
-                
-            } else if (selectedInput.id === "mp4-local" || selectedInput.id === "mp3-local") {
-                data = await generateQuizFromMedia(file, questionCount.id, difficulty.id);
-            } else if (selectedInput.id === "document") {
+            } 
+            else if (selectedInput.id === "mp4-local" || selectedInput.id === "mp3-local") {
+                // Use cloudinaryUrl if available, otherwise fall back to direct upload
+                if (cloudinaryUrl && cloudinaryData) {
+                    data = await generateQuizFromMediaUrl(
+                        cloudinaryUrl, 
+                        questionCount.id, 
+                        difficulty.id,
+                        "MCQ",
+                        {
+                            deleteAfterProcessing: true,
+                            cloudinaryPublicId: cloudinaryData.public_id,
+                            resourceType: cloudinaryData.resource_type || 'video'
+                        }
+                    );
+                } else {
+                    data = await generateQuizFromMedia(
+                        file, 
+                        questionCount.id, 
+                        difficulty.id, 
+                        "MCQ",
+                        true // Try to use Cloudinary if not already uploaded
+                    );
+                }
+            }
+            else if (selectedInput.id === "mp4-url" || selectedInput.id === "mp3-url") {
+                data = await generateQuizFromMediaUrl(inputValue, questionCount.id, difficulty.id);
+            } 
+            else if (selectedInput.id === "document") {
                 data = await generateQuizFromDocument(file, questionCount.id, difficulty.id);
-            } else {
+            } 
+            else {
                 throw new Error("Unsupported input type");
             }
+            
             navigate(`/attemptquiz/${data.assessmentId}`);
         } catch (err) {
             setError(err.message);
         } finally {
             setLoading(false);
         }
-    }
+    };
 
     const triggerFileInput = () => {
         fileInputRef.current.click()
@@ -272,22 +348,47 @@ const GenerateQuiz = () => {
                                         />
 
                                         {file ? (
-                                            <div className="flex items-center justify-center">
-                                                <FileUp className="h-6 w-6 text-cyan-500 mr-2" />
-                                                <span className="text-slate-300">{file.name}</span>
+                                            <div className="flex flex-col items-center">
+                                                <div className="flex items-center justify-center mb-2">
+                                                    <FileUp className="h-6 w-6 text-cyan-500 mr-2" />
+                                                    <span className="text-slate-300">{file.name}</span>
+                                                    <span className="text-slate-500 ml-2">({(file.size / (1024 * 1024)).toFixed(2)} MB)</span>
+                                                </div>
+                                                
+                                                {isUploading && (
+                                                    <div className="w-full mt-2">
+                                                        <div className="h-1.5 w-full bg-slate-700 rounded-full overflow-hidden">
+                                                            <div 
+                                                                className="h-full bg-gradient-to-r from-cyan-500 to-indigo-600 rounded-full"
+                                                                style={{width: `${uploadProgress}%`}}
+                                                            ></div>
+                                                        </div>
+                                                        <p className="text-xs text-slate-400 mt-1">Uploading to cloud: {uploadProgress}%</p>
+                                                    </div>
+                                                )}
+                                                
+                                                {cloudinaryUrl && (
+                                                    <div className="mt-2 text-xs text-emerald-500">
+                                                        Successfully uploaded to cloud
+                                                    </div>
+                                                )}
                                             </div>
                                         ) : (
                                             <div>
                                                 <Upload className="h-12 w-12 text-slate-500 mx-auto mb-2" />
                                                 <p className="text-slate-400 mb-1">Drag and drop your file here or click to browse</p>
-                                                <p className="text-slate-500 text-sm">Maximum file size: 15MB</p>
+                                                <p className="text-slate-500 text-sm">
+                                                    Maximum file size: {selectedInput.id === "document" ? "25MB" : "100MB"}
+                                                </p>
                                             </div>
                                         )}
                                     </div>
                                 ) : (
                                     <input
                                         type="text"
-                                        className={`w-full bg-slate-900 border rounded-lg p-4 text-slate-300 focus:outline-none focus:ring-2 focus:ring-cyan-500/50 ${error ? "border-red-500" : "border-slate-700"}`}
+                                        className={`w-full bg-slate-900 border rounded-lg p-4 text-slate-300 focus:outline-none focus:ring-2 focus:ring-cyan-500/50 ${
+                                            error ? "border-red-500" : "border-slate-700"
+                                        }`}
                                         placeholder={selectedInput.placeholder}
                                         value={inputValue}
                                         onChange={handleInputChange}
@@ -383,20 +484,24 @@ const GenerateQuiz = () => {
                         {/* Submit Button */}
                         {selectedInput && (
                             <button
-                                className="w-full py-4 bg-gradient-to-r from-cyan-500 to-indigo-600 hover:from-cyan-600 hover:to-indigo-700 text-white font-bold rounded-lg shadow-lg shadow-cyan-500/20 hover:shadow-cyan-500/40 transition-all"
+                                className={`w-full py-4 ${
+                                    isUploading || loading
+                                    ? "bg-slate-700 cursor-not-allowed"
+                                    : "bg-gradient-to-r from-cyan-500 to-indigo-600 hover:from-cyan-600 hover:to-indigo-700"
+                                } text-white font-bold rounded-lg shadow-lg shadow-cyan-500/20 hover:shadow-cyan-500/40 transition-all`}
                                 onClick={handleSubmit}
-                                disabled={loading}
+                                disabled={isUploading || loading}
                             >
-                                Generate Quiz
+                                {isUploading ? "Uploading..." : loading ? "Generating..." : "Generate Quiz"}
                             </button>
                         )}
 
-                        {error && <p>Error: {error}</p>}
+                        {error && <p className="text-red-500 mt-2">{error}</p>}
                     </div>
                 </div>
             </div>
         </section>
-    )
-}
+    );
+};
 
-export default GenerateQuiz
+export default GenerateQuiz;

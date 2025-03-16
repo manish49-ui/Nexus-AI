@@ -13,10 +13,15 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const TEMP_DIR = path.resolve(__dirname, '../temp');
+const IS_SERVERLESS = process.env.IS_SERVERLESS === 'true';
 
-// Ensure temp directory exists
-if (!fs.existsSync(TEMP_DIR)) {
-  fs.mkdirSync(TEMP_DIR, { recursive: true });
+// Create temp directory only in non-serverless environments
+if (!IS_SERVERLESS && !fs.existsSync(TEMP_DIR)) {
+  try {
+    fs.mkdirSync(TEMP_DIR, { recursive: true });
+  } catch (err) {
+    console.warn('Unable to create temp directory:', err.message);
+  }
 }
 
 // OCR Space API key
@@ -84,16 +89,31 @@ const extractTextFromPDF = async (pdfBuffer) => {
 
 /**
  * Process PDF with OCR using OCR.space API
- * Returns text by page
- * @param {string} pdfPath - Path to PDF file
+ * Uses direct buffer upload if in serverless environment
+ * @param {string|Buffer} pdfInput - Path to PDF file or PDF buffer
  * @returns {Promise<Object>} Object with text by pages and full text
  */
-const processPDFWithOCR = async (pdfPath) => {
+const processPDFWithOCR = async (pdfInput) => {
     try {
         console.log('Processing PDF with OCR...');
-
         const formData = new FormData();
-        formData.append('file', fs.createReadStream(pdfPath));
+        
+        if (IS_SERVERLESS || Buffer.isBuffer(pdfInput)) {
+            // In serverless environment or if buffer is provided, use buffer directly
+            console.log('Using direct buffer upload for OCR in serverless mode');
+            const buffer = Buffer.isBuffer(pdfInput) ? pdfInput : fs.readFileSync(pdfInput);
+            
+            // Add buffer directly to form data
+            formData.append('file', buffer, {
+                filename: 'document.pdf',
+                contentType: 'application/pdf'
+            });
+        } else {
+            // In normal environment with filesystem access, use file stream
+            console.log('Using file stream for OCR');
+            formData.append('file', fs.createReadStream(pdfInput));
+        }
+        
         formData.append('apikey', OCR_API_KEY);
         formData.append('language', 'eng');
         formData.append('isCreateSearchablePdf', 'false');
@@ -157,36 +177,29 @@ const processPDFWithOCR = async (pdfPath) => {
  * @returns {Promise<Object>} Object with text by pages and full text
  */
 export const extractTextFromPdfFile = async (pdfInput, forceOCR = false) => {
-    let pdfPath = '';
-    let shouldDeleteTempFile = false;
+    let pdfBuffer = null;
 
     try {
         // Determine if input is a buffer or a path
         if (Buffer.isBuffer(pdfInput)) {
-            // Save buffer to temp file
-            const tempFileName = `pdf_${uuidv4()}.pdf`;
-            pdfPath = path.join(TEMP_DIR, tempFileName);
-            fs.writeFileSync(pdfPath, pdfInput);
-            shouldDeleteTempFile = true;
+            // Input is already a buffer
+            pdfBuffer = pdfInput;
         } else if (typeof pdfInput === 'string') {
-            // Input is already a path
-            pdfPath = pdfInput;
-            
-            if (!fs.existsSync(pdfPath)) {
-                throw new Error(`PDF file not found at: ${pdfPath}`);
+            // Input is a path
+            if (!fs.existsSync(pdfInput)) {
+                throw new Error(`PDF file not found at: ${pdfInput}`);
             }
+            // Read the PDF file buffer
+            pdfBuffer = fs.readFileSync(pdfInput);
         } else {
             throw new Error('Invalid input: must be a buffer or file path');
         }
-
-        // Read the PDF file
-        const pdfBuffer = fs.readFileSync(pdfPath);
 
         let extractionResult;
 
         if (!forceOCR) {
             try {
-                // Try direct text extraction first
+                // Try direct text extraction first (works directly with buffer)
                 extractionResult = await extractTextFromPDF(pdfBuffer);
 
                 // Check if text extraction yielded sufficient content
@@ -194,44 +207,31 @@ export const extractTextFromPdfFile = async (pdfInput, forceOCR = false) => {
                 const totalTextLength = extractionResult.allText.trim().length;
                 if (totalTextLength < 100) {
                     console.log('Direct extraction yielded limited text, trying OCR...');
-                    extractionResult = await processPDFWithOCR(pdfPath);
+                    
+                    // Use OCR with buffer directly, avoiding file system in serverless
+                    extractionResult = await processPDFWithOCR(pdfBuffer);
                 }
             } catch (directError) {
                 console.warn('Direct text extraction failed, falling back to OCR:', directError.message);
-                extractionResult = await processPDFWithOCR(pdfPath);
+                
+                // Use OCR with buffer directly, avoiding file system in serverless
+                extractionResult = await processPDFWithOCR(pdfBuffer);
             }
         } else {
             // Skip direct extraction if OCR is forced
-            extractionResult = await processPDFWithOCR(pdfPath);
+            extractionResult = await processPDFWithOCR(pdfBuffer);
         }
 
-        // Get metadata about the file
-        const fileStats = fs.statSync(pdfPath);
-        
-        // Add file metadata
+        // Add basic metadata
         return {
             ...extractionResult,
             metadata: {
-                filename: path.basename(pdfPath),
-                size: fileStats.size,
-                created: fileStats.birthtime,
-                modified: fileStats.mtime,
                 ocrUsed: forceOCR || extractionResult.pages.some(page => page.exitCode !== undefined)
             }
         };
     } catch (error) {
         console.error('Error in PDF text extraction:', error);
         throw new Error(`Failed to extract text from PDF: ${error.message}`);
-    } finally {
-        // Clean up temp file if we created one
-        if (shouldDeleteTempFile && fs.existsSync(pdfPath)) {
-            try {
-                fs.unlinkSync(pdfPath);
-                console.log('Temporary PDF file deleted');
-            } catch (err) {
-                console.error('Error deleting temporary PDF file:', err);
-            }
-        }
     }
 };
 

@@ -121,7 +121,7 @@ const login = async (req, res) => {
         // sending accessToken and refreshToken as cookies
         const options = {
             httpOnly: true,  // Cannot be accessed via JavaScript (only sent with HTTP requests)
-            secure: process.env.NODE_ENV === 'production', // Set to true only in production (for HTTPS)
+            secure: true,
             sameSite: 'None', // Allows cross-origin cookie transmission (important for cross-origin requests)
         };
 
@@ -188,7 +188,7 @@ const refreshAccessToken = async (req, res) => {
 
         const options = {
             httpOnly: true,  // Cannot be accessed via JavaScript (only sent with HTTP requests)
-            secure: process.env.NODE_ENV === 'production', // Set to true only in production (for HTTPS)
+            secure: true,
             sameSite: 'None', // Allows cross-origin cookie transmission (important for cross-origin requests)
         };
 
@@ -237,7 +237,7 @@ const logout = async (req, res) => {
 
         const options = {
             httpOnly: true,  // Cannot be accessed via JavaScript (only sent with HTTP requests)
-            secure: process.env.NODE_ENV === 'production', // Set to true only in production (for HTTPS)
+            secure: true,
             sameSite: 'None', // Allows cross-origin cookie transmission (important for cross-origin requests)
         };
         return res

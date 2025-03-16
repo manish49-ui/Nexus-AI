@@ -6,14 +6,14 @@ import { v4 as uuidv4 } from 'uuid';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import ytdl from '@distube/ytdl-core';
-import transcribeAudioVideo from '../helper/transcribeAudioVideo.js';
 import fetchYouTubeAudio from '../helper/fetchYouTubeAudio.js';
+import transcribeAudioVideo from '../helper/transcribeAudioVideo.js';
 import generateAssessmentPromptCall from '../helper/generateAssessmentPromptCall.js';
-import convertVideoToAudio from '../helper/convertVideoToAudio.js';
 import { extractTextFromPdfFile } from '../helper/pdfToText.js';
 import { extractTextFromPptFile } from '../helper/pptToText.js';
 import { saveAssessment } from '../helper/saveAssessment.js';
 import User from "../models/user.model.js";
+import { uploadBufferToCloudinary } from '../helper/cloudinaryHelper.js';
 
 // Setup paths
 const __filename = fileURLToPath(import.meta.url);
@@ -26,10 +26,7 @@ if (!fs.existsSync(UPLOAD_DIR)) {
 }
 
 // Configure multer storage
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-    filename: (req, file, cb) => cb(null, `${uuidv4()}${path.extname(file.originalname)}`)
-});
+const storage = multer.memoryStorage();
 
 // Create a more flexible file filter
 const mediaFileFilter = (req, file, cb) => {
@@ -63,14 +60,14 @@ const documentFileFilter = (req, file, cb) => {
 
 // Export a single multer middleware that accepts both video and audio
 const mediaUpload = multer({
-    storage,
+    storage, // Use the memory storage
     fileFilter: mediaFileFilter,
     limits: { fileSize: 100 * 1024 * 1024 } // 100MB max for all media
 });
 
 // Create document upload middleware
 const documentUpload = multer({
-    storage,
+    storage, // Use the memory storage
     fileFilter: documentFileFilter,
     limits: { fileSize: 25 * 1024 * 1024 } // 25MB max for documents
 });
@@ -93,24 +90,6 @@ const documentFields = [
     { name: 'ppt', maxCount: 1 },
     { name: 'pptx', maxCount: 1 }
 ];
-
-// Remove individual video and audio upload middleware
-// (Keeping the code here for reference, but will not use them)
-/*
-export const videoUpload = multer({
-    storage,
-    fileFilter: videoFilter,
-    limits: { fileSize: 100 * 1024 * 1024 } 
-});
-
-export const audioUpload = multer({
-    storage,
-    fileFilter: audioFilter,
-    limits: { fileSize: 50 * 1024 * 1024 } 
-});
-*/
-
-
 
 /**
  * Generate assessment from YouTube video
@@ -168,7 +147,7 @@ const generateAssessmentFromYoutube = async (req, res) => {
         // Save to database if user ID is available
         let savedAssessment = null;
         const userId = req.user?._id;
-        
+
         try {
             savedAssessment = await saveAssessment(
                 assessment,
@@ -212,188 +191,160 @@ const generateAssessmentFromYoutube = async (req, res) => {
 };
 
 /**
- * Modified to handle both video and audio files
+ * Generate assessment from media URL (direct URL or Cloudinary URL)
  */
-const generateAssessmentFromMedia = async (req, res) => {
+const generateAssessmentFromMediaUrl = async (req, res) => {
     const timeoutId = setTimeout(() => {
         res.status(504).json({ success: false, message: 'Request timed out' });
     }, 300000); // 5 minutes timeout
 
     try {
-        console.log("Files received:", req.files ? Object.keys(req.files) : "none");
-        console.log("Single file:", req.file ? req.file.fieldname : "none");
+        const {
+            mediaUrl,
+            numberOfQuestions = 5,
+            difficulty = 'medium',
+            type = 'MCQ',
+            deleteAfterProcessing = false,
+            cloudinaryPublicId = null,
+            resourceType = 'video'  // Default resource type for media
+        } = req.body;
 
-        // Find the uploaded file (regardless of field name)
-        let uploadedFile = null;
-
-        // First check for req.files (for fields)
-        if (req.files) {
-            // Look through each field name we accept
-            for (const fieldName of ['media', 'file', 'audio', 'video', 'audioFile', 'videoFile']) {
-                if (req.files[fieldName] && req.files[fieldName].length > 0) {
-                    uploadedFile = req.files[fieldName][0];
-                    break;
-                }
-            }
-        }
-        // Then check for req.file (for single uploads)
-        else if (req.file) {
-            uploadedFile = req.file;
-        }
-
-        if (!uploadedFile) {
+        if (!mediaUrl) {
             clearTimeout(timeoutId);
             return res.status(400).json({
                 success: false,
-                message: 'No media file uploaded. Please use one of these field names: media, file, audio, video, audioFile, videoFile'
+                message: 'Media URL is required'
             });
         }
 
-        const filePath = uploadedFile.path;
-        const fileName = uploadedFile.originalname;
-        const fileType = uploadedFile.mimetype;
-        const { numberOfQuestions = 5, difficulty = 'medium', type = 'MCQ' } = req.body;
+        console.log(`Processing media from URL: ${mediaUrl}`);
 
-        console.log(`Processing media file: ${fileName} (${fileType}) from field ${uploadedFile.fieldname}`);
+        // Use Assembly AI API with the provided URL
+        const ASSEMBLY_API_KEY = process.env.ASSEMBLY_API_KEY;
+        if (!ASSEMBLY_API_KEY) {
+            clearTimeout(timeoutId);
+            throw new Error('ASSEMBLY_API_KEY is not set in environment variables');
+        }
 
-        // Track paths for cleanup
-        const pathsToCleanup = [];
-        let audioPath = filePath;
-        let tempAudioCreated = false;
+        // Submit transcription job using the URL
+        const response = await axios.post(
+            "https://api.assemblyai.com/v2/transcript",
+            {
+                audio_url: mediaUrl,
+                punctuate: true,
+                format_text: true,
+                speaker_labels: true
+            },
+            { headers: { authorization: ASSEMBLY_API_KEY } }
+        );
 
-        // Determine if this is a video or audio file
-        const isVideo = fileType.startsWith('video/');
+        const transcriptId = response.data.id;
+        console.log(`Transcription job started with ID: ${transcriptId}`);
 
-        try {
-            // If it's a video, extract the audio or try to use as-is if extraction fails
-            if (isVideo) {
-                try {
-                    console.log('Converting video to audio...');
-                    audioPath = await convertVideoToAudio(filePath);
-                    console.log(`Audio extracted to: ${audioPath}`);
-                    tempAudioCreated = true;
-                } catch (conversionError) {
-                    console.error('Video conversion failed, trying to use video file directly:', conversionError.message);
-                    // Keep using the original file path
-                    // Some audio APIs might be able to extract audio from video files directly
-                }
-            }
+        // Poll for completion
+        let isCompleted = false;
+        let transcript = '';
 
-            // Transcribe the audio/video
-            console.log('Transcribing media...');
-
-            // Create a copy of the file to avoid deletion conflicts
-            const tempFileName = `trans_${uuidv4()}${path.extname(audioPath)}`;
-            const tempFilePath = path.join(path.dirname(audioPath), tempFileName);
-
-            try {
-                const audioFile = fs.readFileSync(audioPath);
-                fs.writeFileSync(tempFilePath, audioFile);
-                pathsToCleanup.push(tempFilePath);
-            } catch (copyError) {
-                console.error('Error creating file copy:', copyError);
-                // Fall back to using the original file with deleteFile: false option
-                tempAudioCreated = false;
-            }
-
-            // Use tempFilePath if successful, otherwise use original with delete:false
-            const transcriptionResult = await transcribeAudioVideo(
-                pathsToCleanup.includes(tempFilePath) ? tempFilePath : audioPath,
-                { deleteFile: !pathsToCleanup.includes(tempFilePath) }
+        while (!isCompleted) {
+            const statusResponse = await axios.get(
+                `https://api.assemblyai.com/v2/transcript/${transcriptId}`,
+                { headers: { authorization: ASSEMBLY_API_KEY } }
             );
 
-            const transcript = transcriptionResult.text;
-            console.log(transcript);
-            if (!transcript) {
+            const status = statusResponse.data.status;
+            console.log(`Transcription status: ${status}`);
+
+            if (status === "completed") {
+                isCompleted = true;
+                transcript = statusResponse.data.text;
+            } else if (status === "failed") {
                 clearTimeout(timeoutId);
-                throw new Error('Insufficient speech content in media');
+                throw new Error("Transcription failed: " + (statusResponse.data.error || "Unknown error"));
+            } else {
+                // Wait before checking again
+                await new Promise(resolve => setTimeout(resolve, 5000));
             }
+        }
 
-            // Generate assessment
-            console.log(`Generating ${numberOfQuestions} ${difficulty} ${type} questions...`);
-            const assessmentJson = await generateAssessmentPromptCall(transcript, type, numberOfQuestions, difficulty);
+        if (!transcript) {
+            clearTimeout(timeoutId);
+            throw new Error('Insufficient speech content in media');
+        }
 
-            // Parse result
-            let assessment;
-            try {
-                const match = assessmentJson.match(/\[[\s\S]*\]/);
-                assessment = match ? JSON.parse(match[0]) : JSON.parse(assessmentJson);
-            } catch (error) {
-                assessment = { rawResponse: assessmentJson };
-            }
-            
-            // Save to database if user ID is available
-            let savedAssessment = null;
-            const userId = req.user?._id;
-            
-            try {
-                savedAssessment = await saveAssessment(
-                    assessment,
-                    {
-                        fileName,
-                        type,
-                        difficulty,
-                        source: isVideo ? 'video' : 'audio',
-                        transcript: JSON.stringify(transcript)
-                    },
-                    { userId }
-                );
+        console.log(`Generating ${numberOfQuestions} ${difficulty} ${type} questions...`);
+        const assessmentJson = await generateAssessmentPromptCall(transcript, type, numberOfQuestions, difficulty);
 
-                // Add assessment to user's created assessments
+        // Parse result
+        let assessment;
+        try {
+            const match = assessmentJson.match(/\[[\s\S]*\]/);
+            assessment = match ? JSON.parse(match[0]) : JSON.parse(assessmentJson);
+        } catch (error) {
+            assessment = { rawResponse: assessmentJson };
+        }
+
+        // Save to database if user ID is available
+        let savedAssessment = null;
+        const userId = req.user?._id;
+
+        try {
+            // Extract filename from URL if possible
+            const urlParts = mediaUrl.split('/');
+            const fileName = urlParts[urlParts.length - 1].split('?')[0] || 'media-file';
+
+            savedAssessment = await saveAssessment(
+                assessment,
+                {
+                    fileName,
+                    type,
+                    difficulty,
+                    source: 'media-url',
+                    transcript: JSON.stringify(transcript)
+                },
+                { userId }
+            );
+
+            // Add assessment to user's created assessments
+            if (userId) {
                 await User.findByIdAndUpdate(
                     userId,
                     { $addToSet: { assessmentCreated: savedAssessment._id } }
                 );
-            } catch (dbError) {
-                console.error('Failed to save to database:', dbError);
-                // Continue even if database save fails
             }
+        } catch (dbError) {
+            console.error('Failed to save to database:', dbError);
+            // Continue even if database save fails
+        }
 
-            clearTimeout(timeoutId);
-            res.status(200).json({
-                success: true,
-                fileName,
-                mediaType: isVideo ? 'video' : 'audio',
-                assessment,
-                metadata: {
-                    type,
-                    difficulty,
-                    questionCount: numberOfQuestions,
-                    transcriptLength: transcript.length
-                },
-                // Include assessment ID if saved successfully
-                ...(savedAssessment && { assessmentId: savedAssessment._id })
-            });
-        } finally {
-            // Clean up files safely
+        // Delete from Cloudinary if requested
+        if (deleteAfterProcessing && cloudinaryPublicId) {
             try {
-                // Clean up original file if it still exists
-                if (fs.existsSync(filePath)) {
-                    fs.unlinkSync(filePath);
-                    console.log(`Cleaned up original file: ${filePath}`);
-                }
-
-                // Clean up extracted audio if it was created and still exists
-                if (tempAudioCreated && audioPath !== filePath && fs.existsSync(audioPath)) {
-                    fs.unlinkSync(audioPath);
-                    console.log(`Cleaned up extracted audio: ${audioPath}`);
-                }
-
-                // Clean up any other temp files
-                pathsToCleanup.forEach(p => {
-                    if (fs.existsSync(p)) {
-                        fs.unlinkSync(p);
-                        console.log(`Cleaned up temp file: ${p}`);
-                    }
-                });
-            } catch (cleanupError) {
-                console.error('Error during file cleanup:', cleanupError);
-                // Continue even if cleanup fails
+                await deleteFromCloudinary(cloudinaryPublicId, resourceType);
+                console.log(`Deleted media from Cloudinary: ${cloudinaryPublicId}`);
+            } catch (deleteError) {
+                console.error('Failed to delete from Cloudinary:', deleteError);
+                // Continue even if deletion fails
             }
         }
+
+        clearTimeout(timeoutId);
+        res.status(200).json({
+            success: true,
+            mediaUrl,
+            assessment,
+            metadata: {
+                type,
+                difficulty,
+                questionCount: numberOfQuestions,
+                transcriptLength: transcript.length
+            },
+            // Include assessment ID if saved successfully
+            ...(savedAssessment && { assessmentId: savedAssessment._id })
+        });
+
     } catch (error) {
         clearTimeout(timeoutId);
-        console.error('Error generating assessment from media:', error);
+        console.error('Error generating assessment from media URL:', error);
 
         res.status(500).json({
             success: false,
@@ -404,175 +355,244 @@ const generateAssessmentFromMedia = async (req, res) => {
 };
 
 /**
+ * Modified to handle media files - Now only uses Cloudinary + AssemblyAI approach
+ */
+const generateAssessmentFromMedia = async (req, res) => {
+    // If the request contains a mediaUrl instead of a file, redirect to the URL handler
+
+    try {
+        if (req.body.mediaUrl) {
+            return generateAssessmentFromMediaUrl(req, res);
+        }
+
+        return res.status(200).json({
+            success: false,
+            message: 'Media URL or file is required'
+        });
+
+    } catch (error) {
+        console.error('Error generating assessment from media URL:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error generating assessment',
+            error: error.message
+        });
+
+    }
+};
+
+/**
  * Generate assessment from uploaded document (PDF/PowerPoint)
  */
 const generateAssessmentFromDocument = async (req, res) => {
+    // If the request contains a documentUrl, redirect to the URL handler
+    try {
+
+        if (req.body.documentUrl) {
+            return generateAssessmentFromDocumentUrl(req, res);
+
+        }
+
+        res.status(400).json({
+            success: false,
+            message: 'Document URL is required'
+        });
+
+    } catch (error) {
+        console.error('Error generating assessment from document URL:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error generating assessment',
+            error: error.message
+        });
+    }
+};
+
+/**
+ * Generate assessment from document URL (PDF/PPT from Cloudinary or other source)
+ */
+const generateAssessmentFromDocumentUrl = async (req, res) => {
     const timeoutId = setTimeout(() => {
         res.status(504).json({ success: false, message: 'Request timed out' });
     }, 180000); // 3 minutes timeout
 
     try {
-        console.log("Document files received:", req.files ? Object.keys(req.files) : "none");
-        console.log("Single document:", req.file ? req.file.fieldname : "none");
+        const {
+            documentUrl,
+            numberOfQuestions = 5,
+            difficulty = 'medium',
+            type = 'MCQ',
+            deleteAfterProcessing = false,
+            cloudinaryPublicId = null,
+            resourceType = 'raw'  // Default resource type for documents
+        } = req.body;
 
-        // Find the uploaded file (similar to media handler)
-        let uploadedFile = null;
-
-        if (req.files) {
-            for (const fieldName of ['document', 'file', 'pdf', 'ppt', 'pptx']) {
-                if (req.files[fieldName] && req.files[fieldName].length > 0) {
-                    uploadedFile = req.files[fieldName][0];
-                    break;
-                }
-            }
-        } else if (req.file) {
-            uploadedFile = req.file;
-        }
-
-        if (!uploadedFile) {
+        if (!documentUrl) {
             clearTimeout(timeoutId);
             return res.status(400).json({
                 success: false,
-                message: 'No document file uploaded. Please use one of these field names: document, file, pdf, ppt, pptx'
+                message: 'Document URL is required'
             });
         }
 
-        const filePath = uploadedFile.path;
-        const fileName = uploadedFile.originalname;
-        const fileType = uploadedFile.mimetype;
-        const { numberOfQuestions = 5, difficulty = 'medium', type = 'MCQ' } = req.body;
+        console.log(`Processing document from URL: ${documentUrl}`);
 
-        console.log(`Processing document: ${fileName} (${fileType})`);
+        // Fetch the document from the URL
+        let documentBuffer;
+        try {
+            const response = await axios({
+                method: 'GET',
+                url: documentUrl,
+                responseType: 'arraybuffer'
+            });
+
+            documentBuffer = Buffer.from(response.data);
+            console.log(`Downloaded document: ${documentBuffer.length} bytes`);
+        } catch (fetchError) {
+            clearTimeout(timeoutId);
+            console.error('Error fetching document:', fetchError);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to fetch document from URL',
+                error: fetchError.message
+            });
+        }
+
+        // Determine file type from URL
+        const urlLower = documentUrl.toLowerCase();
+        let fileType;
+        let documentText;
+        let documentMetadata = {};
+
+        // Extract text based on detected file type
+        if (urlLower.endsWith('.pdf')) {
+            console.log('Processing PDF document...');
+            fileType = 'application/pdf';
+            const pdfResult = await extractTextFromPdfFile(documentBuffer, false);
+            documentText = pdfResult.allText;
+            documentMetadata = {
+                pageCount: pdfResult.pageCount,
+                documentType: 'PDF',
+                cloudinaryUrl: documentUrl
+            };
+        }
+        else if (urlLower.endsWith('.ppt') || urlLower.endsWith('.pptx')) {
+            console.log('Processing PowerPoint document...');
+            fileType = urlLower.endsWith('.ppt') ?
+                'application/vnd.ms-powerpoint' :
+                'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+
+            const pptResult = await extractTextFromPptFile(documentBuffer);
+            documentText = pptResult.allText;
+            documentMetadata = {
+                slideCount: pptResult.slideCount,
+                title: pptResult.title,
+                documentType: urlLower.endsWith('.ppt') ? 'PPT' : 'PPTX',
+                cloudinaryUrl: documentUrl
+            };
+        } else {
+            clearTimeout(timeoutId);
+            return res.status(400).json({
+                success: false,
+                message: 'Unsupported document type. Only PDF, PPT, and PPTX are supported.'
+            });
+        }
+
+        // Get filename from URL
+        const urlParts = documentUrl.split('/');
+        const fileName = urlParts[urlParts.length - 1].split('?')[0] || 'document';
+
+        // Validate that we have enough text to work with
+        if (!documentText || documentText.length < 100) {
+            clearTimeout(timeoutId);
+            return res.status(400).json({
+                success: false,
+                message: 'Document contains insufficient text for assessment generation',
+                error: 'The document has too little text content (minimum 100 characters required)'
+            });
+        }
+
+        console.log(`Document text extracted, length: ${documentText.length} characters`);
+        console.log(`Generating ${numberOfQuestions} ${difficulty} ${type} questions...`);
+
+        // Generate assessment
+        const assessmentJson = await generateAssessmentPromptCall(documentText, type, numberOfQuestions, difficulty);
+
+        // Parse result
+        let assessment;
+        try {
+            const match = assessmentJson.match(/\[[\s\S]*\]/);
+            assessment = match ? JSON.parse(match[0]) : JSON.parse(assessmentJson);
+        } catch (error) {
+            console.error('Failed to parse assessment JSON:', error);
+            assessment = { rawResponse: assessmentJson };
+        }
+
+        // Save to database if user ID is available
+        let savedAssessment = null;
+        const userId = req.user?._id;
 
         try {
-            // Extract text based on file type
-            let documentText;
-            let documentMetadata = {};
+            // For documents, use document metadata
+            const title = documentMetadata.title || `${documentMetadata.documentType} Assessment`;
 
-            if (fileType === 'application/pdf') {
-                console.log('Processing PDF document...');
-                const pdfResult = await extractTextFromPdfFile(filePath, false);
-                documentText = pdfResult.allText;
-                documentMetadata = {
-                    pageCount: pdfResult.pageCount,
-                    documentType: 'PDF'
-                };
-            }
-            else if (fileType === 'application/vnd.ms-powerpoint' ||
-                fileType === 'application/vnd.openxmlformats-officedocument.presentationml.presentation') {
-                console.log('Processing PowerPoint document...');
-                const pptResult = await extractTextFromPptFile(filePath);
-                documentText = pptResult.allText;
-                documentMetadata = {
-                    slideCount: pptResult.slideCount,
-                    title: pptResult.title,
-                    documentType: fileType === 'application/vnd.ms-powerpoint' ? 'PPT' : 'PPTX'
-                };
-            } else {
-                throw new Error(`Unsupported document type: ${fileType}`);
-            }
+            savedAssessment = await saveAssessment(
+                assessment,
+                {
+                    ...documentMetadata,
+                    fileName,
+                    type,
+                    difficulty,
+                    transcript: JSON.stringify(documentText)
+                },
+                {
+                    userId,
+                    title,
+                    description: `Assessment based on ${documentMetadata.documentType} document with ${documentMetadata.pageCount || documentMetadata.slideCount || 'multiple'} pages.`
+                }
+            );
 
-            // Validate that we have enough text to work with
-            if (!documentText || documentText.length < 100) {
-                clearTimeout(timeoutId);
-                return res.status(400).json({
-                    success: false,
-                    message: 'Document contains insufficient text for assessment generation',
-                    error: 'The document has too little text content (minimum 100 characters required)'
-                });
-            }
-
-            console.log(`Document text extracted, length: ${documentText.length} characters`);
-            console.log(`Generating ${numberOfQuestions} ${difficulty} ${type} questions...`);
-
-            // Generate assessment
-            const assessmentJson = await generateAssessmentPromptCall(documentText, type, numberOfQuestions, difficulty);
-
-            // Parse result
-            let assessment;
-            try {
-                const match = assessmentJson.match(/\[[\s\S]*\]/);
-                assessment = match ? JSON.parse(match[0]) : JSON.parse(assessmentJson);
-            } catch (error) {
-                console.error('Failed to parse assessment JSON:', error);
-                assessment = { rawResponse: assessmentJson };
-            }
-            
-            // Save to database if user ID is available
-            let savedAssessment = null;
-            const userId = req.user?._id;
-            
-            try {
-                // For documents, use document metadata
-                const title = documentMetadata.title || `${documentMetadata.documentType} Assessment`;
-                
-                savedAssessment = await saveAssessment(
-                    assessment,
-                    {
-                        ...documentMetadata,
-                        fileName,
-                        type,
-                        difficulty,
-                        transcript: JSON.stringify(documentText)
-                    },
-                    { 
-                        userId,
-                        title,
-                        description: `Assessment based on ${documentMetadata.documentType} document with ${documentMetadata.pageCount || documentMetadata.slideCount || 'multiple'} pages.`
-                    }
-                );
-
-                // Add assessment to user's created assessments
+            // Add assessment to user's created assessments
+            if (userId) {
                 await User.findByIdAndUpdate(
                     userId,
                     { $addToSet: { assessmentCreated: savedAssessment._id } }
                 );
-            } catch (dbError) {
-                console.error('Failed to save to database:', dbError);
-                // Continue even if database save fails
             }
-
-            // Clean up the file
-            try {
-                fs.unlinkSync(filePath);
-                console.log(`Cleaned up document file: ${filePath}`);
-            } catch (cleanupError) {
-                console.error('Error cleaning up document file:', cleanupError);
-            }
-
-            clearTimeout(timeoutId);
-            res.status(200).json({
-                success: true,
-                fileName,
-                documentType: documentMetadata.documentType,
-                assessment,
-                metadata: {
-                    ...documentMetadata,
-                    type,
-                    difficulty,
-                    questionCount: numberOfQuestions,
-                    textLength: documentText.length
-                },
-                // Include assessment ID if saved successfully
-                ...(savedAssessment && { assessmentId: savedAssessment._id })
-            });
-
-        } catch (processingError) {
-            // Clean up on processing error
-            try {
-                if (fs.existsSync(filePath)) {
-                    fs.unlinkSync(filePath);
-                }
-            } catch (cleanupError) {
-                console.error('Error cleaning up file after processing error:', cleanupError);
-            }
-
-            throw processingError; // Re-throw to be caught by outer catch
+        } catch (dbError) {
+            console.error('Failed to save to database:', dbError);
+            // Continue even if database save fails
         }
 
+        // Delete from Cloudinary if requested
+        if (deleteAfterProcessing && cloudinaryPublicId) {
+            try {
+                await deleteFromCloudinary(cloudinaryPublicId, resourceType);
+                console.log(`Deleted document from Cloudinary: ${cloudinaryPublicId}`);
+            } catch (deleteError) {
+                console.error('Failed to delete from Cloudinary:', deleteError);
+                // Continue even if deletion fails
+            }
+        }
+
+        clearTimeout(timeoutId);
+        res.status(200).json({
+            success: true,
+            fileName,
+            documentType: documentMetadata.documentType,
+            assessment,
+            metadata: {
+                ...documentMetadata,
+                type,
+                difficulty,
+                questionCount: numberOfQuestions,
+                textLength: documentText.length
+            },
+            ...(savedAssessment && { assessmentId: savedAssessment._id })
+        });
     } catch (error) {
         clearTimeout(timeoutId);
-        console.error('Error generating assessment from document:', error);
+        console.error('Error generating assessment from document URL:', error);
 
         res.status(500).json({
             success: false,
@@ -582,14 +602,54 @@ const generateAssessmentFromDocument = async (req, res) => {
     }
 };
 
+/**
+ * Helper function to delete media from Cloudinary
+ * @param {string} publicId - The Cloudinary public ID to delete
+ * @param {string} resourceType - Optional resource type (defaults to 'video' which handles both audio/video)
+ */
+const deleteFromCloudinary = async (publicId, resourceType = 'video') => {
+    if (!publicId) {
+        console.warn('No public ID provided for Cloudinary deletion');
+        return null;
+    }
+
+    try {
+        // Import the cloudinary library if not already imported
+        const cloudinary = (await import('cloudinary')).v2;
+
+        // Configure cloudinary
+        cloudinary.config({
+            cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+            api_key: process.env.CLOUDINARY_API_KEY,
+            api_secret: process.env.CLOUDINARY_API_SECRET
+        });
+
+        console.log(`Attempting to delete from Cloudinary: ${publicId} (type: ${resourceType})`);
+
+        // Delete the resource
+        const result = await cloudinary.uploader.destroy(publicId, {
+            resource_type: resourceType,
+            invalidate: true  // Invalidate any CDN caches
+        });
+
+        console.log(`Cloudinary deletion result for ${publicId}:`, result);
+        return result;
+    } catch (error) {
+        console.error('Error deleting from Cloudinary:', error);
+        throw error;
+    }
+};
 
 // Export the functions
 export {
     generateAssessmentFromYoutube,
     generateAssessmentFromMedia,
+    generateAssessmentFromMediaUrl,
     generateAssessmentFromDocument,
+    generateAssessmentFromDocumentUrl,
     mediaFields,
     documentFields,
     mediaUpload,
-    documentUpload
+    documentUpload,
+    deleteFromCloudinary  // Export for use in other controllers if needed
 };

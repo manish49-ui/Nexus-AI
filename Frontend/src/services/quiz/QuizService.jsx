@@ -31,44 +31,159 @@ const generateQuizFromYoutube = async (
     }
 };
 
+/**
+ * Generate quiz from a media URL (either direct URL or Cloudinary URL)
+ */
+const generateQuizFromMediaUrl = async (
+    mediaUrl,
+    numberOfQuestions = 5,
+    difficulty = "medium",
+    type = "MCQ",
+    options = {}
+) => {
+    const { 
+        deleteAfterProcessing = false, 
+        cloudinaryPublicId = null,
+        resourceType = 'video'  // Default to video for audio/video files
+    } = options;
+    
+    try {
+        const response = await userAxiosInstance1.post("/media-url", {
+            mediaUrl,
+            numberOfQuestions,
+            difficulty,
+            type,
+            deleteAfterProcessing,
+            cloudinaryPublicId,
+            resourceType
+        });
+        return response.data;
+    } catch (error) {
+        console.error("Error generating quiz from media URL:", error);
+        throw error;
+    }
+};
+
+/**
+ * Generate quiz from media file with Cloudinary pre-upload
+ */
 const generateQuizFromMedia = async (
     file,
     numberOfQuestions = 5,
     difficulty = "medium",
     type = "MCQ"
 ) => {
-    const formData = new FormData();
-    formData.append("media", file);
-    formData.append("numberOfQuestions", numberOfQuestions);
-    formData.append("difficulty", difficulty);
-    formData.append("type", type);
-
     try {
-        const response = await userAxiosInstance1.post("/media", formData);
-        return response.data;
+        // Always use Cloudinary approach - no fallback to local
+        console.log('Preparing file upload to Cloudinary...');
+        
+        // Dynamically import to avoid bundling issues
+        const { uploadToCloudinary, getResourceType } = await import('../../utils/cloudinaryUtils');
+        
+        // Upload to Cloudinary with appropriate resource type
+        const resourceType = getResourceType(file);
+        console.log(`Uploading ${file.name} (${file.size} bytes) to Cloudinary as ${resourceType}...`);
+        
+        const cloudinaryResult = await uploadToCloudinary(file, {
+            folder: 'assessments/media',
+            resourceType
+        });
+        
+        console.log('File uploaded to Cloudinary:', cloudinaryResult);
+        
+        // Use the URL-based endpoint for processing
+        console.log('Generating assessment from Cloudinary URL...');
+        return generateQuizFromMediaUrl(
+            cloudinaryResult.url,
+            numberOfQuestions,
+            difficulty,
+            type,
+            {
+                deleteAfterProcessing: true,
+                cloudinaryPublicId: cloudinaryResult.public_id,
+                resourceType: cloudinaryResult.resource_type || resourceType
+            }
+        );
     } catch (error) {
         console.error("Error generating quiz:", error);
         throw error;
     }
 };
 
+/**
+ * Generate quiz from document URL (PDF, PPT, PPTX)
+ */
+const generateQuizFromDocumentUrl = async (
+    documentUrl,
+    numberOfQuestions = 5,
+    difficulty = "medium",
+    type = "MCQ",
+    options = {}
+) => {
+    const { 
+        deleteAfterProcessing = false, 
+        cloudinaryPublicId = null,
+        resourceType = 'raw'  // Default to raw for documents
+    } = options;
+    
+    try {
+        const response = await userAxiosInstance1.post("/document-url", {
+            documentUrl,
+            numberOfQuestions,
+            difficulty,
+            type,
+            deleteAfterProcessing,
+            cloudinaryPublicId,
+            resourceType
+        });
+        return response.data;
+    } catch (error) {
+        console.error("Error generating quiz from document URL:", error);
+        throw error;
+    }
+};
+
+/**
+ * Generate quiz from document file with Cloudinary pre-upload
+ */
 const generateQuizFromDocument = async (
     file,
     numberOfQuestions = 5,
     difficulty = "medium",
     type = "MCQ"
 ) => {
-    const formData = new FormData();
-    formData.append("document", file);
-    formData.append("numberOfQuestions", numberOfQuestions);
-    formData.append("difficulty", difficulty);
-    formData.append("type", type);
-
     try {
-        const response = await userAxiosInstance1.post("/document", formData);
-        return response.data;
+        // Upload document to Cloudinary first
+        console.log('Preparing document upload to Cloudinary...');
+        
+        // Dynamically import to avoid bundling issues
+        const { uploadToCloudinary } = await import('../../utils/cloudinaryUtils');
+        
+        // Upload to Cloudinary as auto resourceType
+        console.log(`Uploading ${file.name} (${file.size} bytes) to Cloudinary...`);
+        
+        const cloudinaryResult = await uploadToCloudinary(file, {
+            folder: 'assessments/documents',
+            resourceType: 'auto'
+        });
+        
+        console.log('Document uploaded to Cloudinary:', cloudinaryResult);
+        
+        // Use URL-based endpoint for processing
+        console.log('Generating assessment from Cloudinary document URL...');
+        return generateQuizFromDocumentUrl(
+            cloudinaryResult.url,
+            numberOfQuestions,
+            difficulty,
+            type,
+            {
+                deleteAfterProcessing: true,
+                cloudinaryPublicId: cloudinaryResult.public_id,
+                resourceType: cloudinaryResult.resource_type || 'raw'
+            }
+        );
     } catch (error) {
-        console.error("Error generating quiz:", error);
+        console.error("Error generating quiz from document:", error);
         throw error;
     }
 };
@@ -144,7 +259,9 @@ const searchAssessments = async (query, difficulty, type) => {
 export {
     generateQuizFromYoutube,
     generateQuizFromMedia,
+    generateQuizFromMediaUrl,
     generateQuizFromDocument,
+    generateQuizFromDocumentUrl,
     submitQuiz,
     fetchQuizData,
     askAssessment,

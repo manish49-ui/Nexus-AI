@@ -6,27 +6,14 @@ import { v4 as uuidv4 } from 'uuid';
 import multer from 'multer';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
+import { uploadBufferToCloudinary } from '../helper/cloudinaryHelper.js';
 
 // Set up file paths
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const UPLOAD_DIR = path.resolve(__dirname, '../uploads');
 
-// Ensure uploads directory exists
-if (!fs.existsSync(UPLOAD_DIR)) {
-    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-}
-
-// Configure multer storage
-const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-        cb(null, UPLOAD_DIR);
-    },
-    filename: function (req, file, cb) {
-        const uniqueFilename = `${uuidv4()}_${file.originalname}`;
-        cb(null, uniqueFilename);
-    }
-});
+// Configure multer storage for memory storage instead of disk
+const storage = multer.memoryStorage();
 
 const fileFilter = (req, file, cb) => {
     // Accept PDF and PowerPoint files
@@ -74,36 +61,55 @@ export const processDocument = async (req, res) => {
             });
         }
 
-        const filePath = req.file.path;
+        const fileBuffer = req.file.buffer;
         const fileType = req.file.mimetype;
         const fileName = req.file.originalname;
         const useOcr = req.body.useOcr === 'true' || req.body.useOcr === true;
 
         console.log(`Processing document: ${fileName}, Type: ${fileType}, OCR: ${useOcr}`);
 
+        // Upload to Cloudinary
+        let cloudinaryResult;
+        try {
+            cloudinaryResult = await uploadBufferToCloudinary(
+                fileBuffer, 
+                'documents',
+                { 
+                    public_id: `doc_${uuidv4()}`,
+                    resource_type: 'auto'
+                }
+            );
+            console.log(`File uploaded to Cloudinary: ${cloudinaryResult.secure_url}`);
+        } catch (uploadError) {
+            console.error('Error uploading to Cloudinary:', uploadError);
+            // Continue with processing even if Cloudinary upload fails
+        }
+
         let result;
 
         // Extract text based on file type
         if (fileType === 'application/pdf') {
-            // Get page-by-page text extraction
-            const pdfResult = await extractTextFromPdfFile(filePath, useOcr);
+            // Get page-by-page text extraction directly from buffer
+            const pdfResult = await extractTextFromPdfFile(fileBuffer, useOcr);
             result = {
                 ...pdfResult,
                 format: 'pdf',
                 fileName: fileName,
-                text: pdfResult.allText // For backward compatibility
+                text: pdfResult.allText, // For backward compatibility
+                cloudinaryUrl: cloudinaryResult?.secure_url
             };
         } 
         else if (fileType === 'application/vnd.ms-powerpoint' || 
                  fileType === 'application/vnd.openxmlformats-officedocument.presentationml.presentation') {
             // PowerPoint extraction already gives slide-by-slide results
-            const pptResult = await extractTextFromPptFile(filePath);
+            const pptResult = await extractTextFromPptFile(fileBuffer);
             result = {
                 ...pptResult,
                 format: fileType === 'application/vnd.ms-powerpoint' ? 'ppt' : 'pptx',
                 fileName: fileName,
                 length: pptResult.allText.length,
-                text: pptResult.allText // For backward compatibility
+                text: pptResult.allText, // For backward compatibility
+                cloudinaryUrl: cloudinaryResult?.secure_url
             };
         }
         else {
@@ -112,33 +118,15 @@ export const processDocument = async (req, res) => {
 
         clearTimeout(timeoutId);
 
-        // Delete the uploaded file after processing
-        try {
-            fs.unlinkSync(filePath);
-        } catch (err) {
-            console.error('Error deleting uploaded file:', err);
-            // Continue even if deletion fails
-        }
-
         // Send response with extracted text
         res.status(200).json({
             success: true,
             message: 'Document processed successfully',
             ...result
         });
-
     } catch (error) {
         clearTimeout(timeoutId);
         console.error('Error processing document:', error);
-
-        // Delete the uploaded file in case of error
-        if (req.file && fs.existsSync(req.file.path)) {
-            try {
-                fs.unlinkSync(req.file.path);
-            } catch (deleteError) {
-                console.error('Error deleting uploaded file:', deleteError);
-            }
-        }
 
         res.status(500).json({
             success: false,

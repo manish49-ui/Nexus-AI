@@ -4,7 +4,6 @@ import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import { v4 as uuidv4 } from 'uuid';
 import dotenv from 'dotenv';
-import { exec } from 'child_process';
 import JSZip from 'jszip';
 import xml2js from 'xml2js';
 
@@ -14,9 +13,14 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const TEMP_DIR = path.resolve(__dirname, '../temp');
 
-// Ensure temp directory exists
-if (!fs.existsSync(TEMP_DIR)) {
-  fs.mkdirSync(TEMP_DIR, { recursive: true });
+// Ensure temp directory exists if not in serverless mode
+const IS_SERVERLESS = process.env.IS_SERVERLESS === 'true';
+if (!IS_SERVERLESS && !fs.existsSync(TEMP_DIR)) {
+  try {
+    fs.mkdirSync(TEMP_DIR, { recursive: true });
+  } catch (err) {
+    console.warn('Unable to create temp directory:', err.message);
+  }
 }
 
 /**
@@ -25,87 +29,49 @@ if (!fs.existsSync(TEMP_DIR)) {
  * @returns {Promise<object>} Object containing extracted text and metadata
  */
 export const extractTextFromPptFile = async (pptInput) => {
-  let pptPath = '';
-  let shouldDeleteTempFile = false;
-  
   try {
     // Determine if input is a buffer or a path
+    let pptBuffer;
+    
     if (Buffer.isBuffer(pptInput)) {
-      // Save buffer to temp file
-      const tempFileName = `ppt_${uuidv4()}.${determineExtension(pptInput)}`;
-      pptPath = path.join(TEMP_DIR, tempFileName);
-      fs.writeFileSync(pptPath, pptInput);
-      shouldDeleteTempFile = true;
+      // Input is already a buffer
+      pptBuffer = pptInput;
     } else if (typeof pptInput === 'string') {
-      // Input is already a path
-      pptPath = pptInput;
-      if (!fs.existsSync(pptPath)) {
-        throw new Error(`PowerPoint file not found at: ${pptPath}`);
+      // Input is a path
+      if (!fs.existsSync(pptInput)) {
+        throw new Error(`PowerPoint file not found at: ${pptInput}`);
       }
+      pptBuffer = fs.readFileSync(pptInput);
     } else {
       throw new Error('Invalid input: must be a buffer or file path');
     }
     
-    // Check file extension to use appropriate extraction method
-    const extension = path.extname(pptPath).toLowerCase();
+    // Check if it's a PPTX (ZIP-based) file by examining the first few bytes
+    const isPptx = pptBuffer[0] === 0x50 && pptBuffer[1] === 0x4B;
     
     // Process based on file type
-    let result;
-    if (extension === '.pptx') {
-      result = await extractFromPptx(pptPath);
-    } else if (extension === '.ppt') {
-      result = await extractFromPpt(pptPath);
+    if (isPptx) {
+      return await extractFromPptxBuffer(pptBuffer);
     } else {
-      throw new Error('Unsupported file format. Only .ppt and .pptx are supported.');
+      return await extractFromBinaryPpt(pptBuffer);
     }
-    
-    return result;
   } catch (error) {
     console.error('Error extracting text from PowerPoint:', error);
     throw new Error(`Failed to extract text from PowerPoint: ${error.message}`);
-  } finally {
-    // Clean up temp file if we created one
-    if (shouldDeleteTempFile && fs.existsSync(pptPath)) {
-      try {
-        fs.unlinkSync(pptPath);
-        console.log('Temporary PowerPoint file deleted');
-      } catch (err) {
-        console.error('Error deleting temporary PowerPoint file:', err);
-      }
-    }
   }
 };
 
 /**
- * Try to determine file extension from buffer content
- * @param {Buffer} buffer - File buffer
- * @returns {string} File extension (pptx or ppt)
- */
-function determineExtension(buffer) {
-  // Check for PPTX signature (ZIP file)
-  if (buffer[0] === 0x50 && buffer[1] === 0x4B) {
-    return 'pptx';
-  }
-  // Default to PPT
-  return 'ppt';
-}
-
-/**
- * Extract text from PPTX file format (newer XML-based format)
- * @param {string} filePath - Path to PPTX file
+ * Extract text from PPTX buffer (newer XML-based format)
+ * @param {Buffer} buffer - PPTX file buffer
  * @returns {Promise<object>} Extracted text by slide
  */
-async function extractFromPptx(filePath) {
+async function extractFromPptxBuffer(buffer) {
   try {
-    console.log(`Reading PPTX file: ${filePath}`);
+    console.log('Processing PPTX from buffer...');
     
-    // Read the file as a ZIP archive
-    const content = fs.readFileSync(filePath);
-    const zip = await JSZip.loadAsync(content);
-    
-    // Parse presentation data
-    const slideCount = countSlides(zip);
-    console.log(`Found ${slideCount} slides`);
+    // Load the buffer as a ZIP archive
+    const zip = await JSZip.loadAsync(buffer);
     
     // Extract text from slides
     const slideTexts = [];
@@ -117,51 +83,52 @@ async function extractFromPptx(filePath) {
       });
     });
     
+    // Find all slide files in the PPTX
+    const slideFiles = Object.keys(zip.files)
+      .filter(name => name.match(/^ppt\/slides\/slide[0-9]+\.xml$/))
+      .sort();
+    
     // Process each slide
-    for (let i = 1; i <= slideCount; i++) {
+    for (const slideFile of slideFiles) {
       try {
-        // Extract slide content
-        const slideKey = `ppt/slides/slide${i}.xml`;
-        if (!zip.files[slideKey]) continue;
-        
-        const slideXml = await zip.file(slideKey).async('string');
+        const slideXml = await zip.file(slideFile).async('string');
         const slideObj = await parseXml(slideXml);
+        const slideNumber = parseInt(slideFile.match(/slide([0-9]+)\.xml/)[1]);
         
-        // Extract text from this slide
-        let slideText = extractTextFromSlideXml(slideObj);
+        // Extract text from slide
+        const slideText = extractTextFromSlideXml(slideObj);
         
         slideTexts.push({
-          slideNumber: i,
+          slideNumber,
           text: slideText
         });
       } catch (slideError) {
-        console.error(`Error processing slide ${i}:`, slideError);
-        slideTexts.push({
-          slideNumber: i,
-          text: `[Error extracting text from slide ${i}: ${slideError.message}]`
-        });
+        console.warn(`Error processing slide ${slideFile}:`, slideError);
+        // Continue with other slides even if one fails
       }
     }
     
     // Extract any notes if available
     const noteTexts = [];
-    for (let i = 1; i <= slideCount; i++) {
+    const noteFiles = Object.keys(zip.files)
+      .filter(name => name.match(/^ppt\/notesSlides\/notesSlide[0-9]+\.xml$/))
+      .sort();
+    
+    for (const noteFile of noteFiles) {
       try {
-        const noteKey = `ppt/notesSlides/notesSlide${i}.xml`;
-        if (zip.files[noteKey]) {
-          const noteXml = await zip.file(noteKey).async('string');
-          const noteObj = await parseXml(noteXml);
-          const noteText = extractTextFromSlideXml(noteObj);
-          
-          if (noteText.trim()) {
-            noteTexts.push({
-              slideNumber: i,
-              text: noteText
-            });
-          }
+        const noteXml = await zip.file(noteFile).async('string');
+        const noteObj = await parseXml(noteXml);
+        const slideNumber = parseInt(noteFile.match(/notesSlide([0-9]+)\.xml/)[1]);
+        const noteText = extractTextFromSlideXml(noteObj);
+        
+        if (noteText.trim()) {
+          noteTexts.push({
+            slideNumber,
+            text: noteText
+          });
         }
       } catch (noteError) {
-        console.warn(`Error processing note ${i}:`, noteError);
+        console.warn(`Error processing note ${noteFile}:`, noteError);
       }
     }
     
@@ -189,79 +156,60 @@ async function extractFromPptx(filePath) {
     return {
       title,
       description,
-      slideCount,
+      slideCount: slideTexts.length,
       allText,
       slides: slideTexts,
       notes: noteTexts
     };
   } catch (error) {
-    console.error('Error extracting text from PPTX:', error);
+    console.error('Error extracting text from PPTX buffer:', error);
     throw error;
   }
 }
 
 /**
- * Extract text from PPT file format (older binary format)
- * @param {string} filePath - Path to PPT file
- * @returns {Promise<object>} Extracted text by slide
+ * Extract text from binary PPT buffer (older format)
+ * @param {Buffer} buffer - PPT file buffer
+ * @returns {Promise<object>} Extracted text
  */
-async function extractFromPpt(filePath) {
+async function extractFromBinaryPpt(buffer) {
   try {
-    console.log(`Processing PPT file: ${filePath}`);
+    console.log('Processing binary PPT from buffer...');
     
-    // Since binary PPT is harder to parse, we'll use text extraction tool or conversion
-    // Option 1: Use Apache Tika (if available)
-    try {
-      return await extractWithTika(filePath);
-    } catch (tikaError) {
-      console.log('Tika extraction failed, falling back to conversion method:', tikaError.message);
-    }
+    // For binary PPT, we'll use simple text extraction
+    // Convert to string
+    const str = buffer.toString('binary');
     
-    // Option 2: Convert to PPTX and then extract
-    try {
-      const pptxPath = await convertPptToPptx(filePath);
-      const result = await extractFromPptx(pptxPath);
-      
-      // Clean up converted file
-      try {
-        fs.unlinkSync(pptxPath);
-      } catch (cleanupError) {
-        console.warn('Failed to delete temporary PPTX:', cleanupError);
+    // Extract text using regex - basic approach
+    const textChunks = [];
+    let regex = /[\u0020-\u007E\u00A0-\u00FF]{4,}/g;
+    let match;
+    
+    while ((match = regex.exec(str)) !== null) {
+      if (match[0].length > 10 && !match[0].includes('PPTX') && !match[0].includes('\u0000')) {
+        textChunks.push(match[0]);
       }
-      
-      return result;
-    } catch (conversionError) {
-      console.error('Conversion to PPTX failed:', conversionError);
-      
-      // Option 3: Extract text using simpler method
-      return await extractPptTextBasic(filePath);
     }
+    
+    const extractedText = textChunks.join('\n');
+    
+    return {
+      title: 'PPT Document',
+      description: '',
+      slideCount: 1,
+      allText: extractedText,
+      slides: [{ slideNumber: 1, text: extractedText }],
+      notes: []
+    };
   } catch (error) {
-    console.error('Error extracting text from PPT:', error);
+    console.error('Error extracting text from binary PPT:', error);
     throw error;
   }
-}
-
-/**
- * Count slides in a PPTX file
- * @param {JSZip} zip - Loaded PPTX as ZIP
- * @returns {number} Number of slides
- */
-function countSlides(zip) {
-  let max = 0;
-  for (const key in zip.files) {
-    const match = key.match(/ppt\/slides\/slide(\d+)\.xml/);
-    if (match && match[1]) {
-      const num = parseInt(match[1], 10);
-      if (num > max) max = num;
-    }
-  }
-  return max;
 }
 
 /**
  * Extract text from slide XML
- * @param {object} slideObj - Parsed slide XML
+ * @param {object} slideObj - Parsed slide XML object
  * @returns {string} Extracted text
  */
 function extractTextFromSlideXml(slideObj) {
@@ -352,88 +300,6 @@ function extractTextFromTextBody(txBody) {
     console.error('Error extracting text from text body:', error);
     return '';
   }
-}
-
-/**
- * Extract text using Apache Tika (if available)
- * @param {string} filePath - Path to PPT file
- * @returns {Promise<object>} Extracted text
- */
-async function extractWithTika(filePath) {
-  return new Promise((resolve, reject) => {
-    // This would use Tika server if available
-    // For now, we'll reject to use the fallback methods
-    reject(new Error('Tika extraction not implemented'));
-  });
-}
-
-/**
- * Convert PPT to PPTX format (requires LibreOffice or similar)
- * @param {string} pptPath - Path to PPT file
- * @returns {Promise<string>} Path to converted PPTX file
- */
-async function convertPptToPptx(pptPath) {
-  return new Promise((resolve, reject) => {
-    const outputDir = TEMP_DIR;
-    const pptxPath = path.join(outputDir, `${path.basename(pptPath, '.ppt')}_${uuidv4()}.pptx`);
-    
-    // Try to use LibreOffice for conversion
-    exec(`soffice --headless --convert-to pptx --outdir "${outputDir}" "${pptPath}"`, (error, stdout, stderr) => {
-      if (error) {
-        console.warn(`LibreOffice conversion failed: ${error.message}`);
-        reject(new Error(`Failed to convert PPT to PPTX: ${error.message}`));
-        return;
-      }
-      
-      resolve(pptxPath);
-    });
-  });
-}
-
-/**
- * Basic text extraction for PPT when other methods fail
- * @param {string} filePath - Path to PPT file
- * @returns {Promise<object>} Extracted text
- */
-async function extractPptTextBasic(filePath) {
-  // Basic binary search for text in PPT file
-  return new Promise((resolve, reject) => {
-    fs.readFile(filePath, (err, data) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      
-      try {
-        // Convert to string
-        const str = data.toString('binary');
-        
-        // Extract text using regex - very basic and limited
-        const textChunks = [];
-        let regex = /[\u0020-\u007E\u00A0-\u00FF]{4,}/g;
-        let match;
-        
-        while ((match = regex.exec(str)) !== null) {
-          if (match[0].length > 10 && !match[0].includes('PPTX')) {
-            textChunks.push(match[0]);
-          }
-        }
-        
-        const extractedText = textChunks.join('\n');
-        
-        resolve({
-          title: path.basename(filePath, '.ppt'),
-          description: '',
-          slideCount: 1,
-          allText: extractedText,
-          slides: [{ slideNumber: 1, text: extractedText }],
-          notes: []
-        });
-      } catch (error) {
-        reject(error);
-      }
-    });
-  });
 }
 
 export default extractTextFromPptFile;

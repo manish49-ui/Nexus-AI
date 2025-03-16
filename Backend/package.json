@@ -36,7 +36,9 @@
     "youtube-caption-extractor": "^1.4.3",
     "youtube-captions-scraper": "^2.0.3",
     "youtube-subs": "^1.1.0",
-    "ytdl-core": "^4.11.5"
+    "ytdl-core": "^4.11.5",
+    "cloudinary": "^1.41.0",
+    "streamifier": "^0.1.1"
   },
   "devDependencies": {
     "@types/pdf-parse": "^1.1.4"

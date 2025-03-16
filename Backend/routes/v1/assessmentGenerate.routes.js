@@ -3,6 +3,8 @@ import {
     generateAssessmentFromYoutube,
     generateAssessmentFromMedia,
     generateAssessmentFromDocument,
+    generateAssessmentFromMediaUrl,
+    generateAssessmentFromDocumentUrl,
     mediaFields,
     documentFields,
     mediaUpload,
@@ -54,6 +56,19 @@ router.post("/media", verifyJWT, mediaUpload.fields(mediaFields), generateAssess
  */
 router.post("/document", verifyJWT, documentUpload.fields(documentFields), generateAssessmentFromDocument);
 
+/**
+ * @route POST /api/v1/assessmentGenerate/media-url
+ * @desc Generate assessment from media URL (MP3/MP4)
+ * @access Private
+ */
+router.post("/media-url", verifyJWT, generateAssessmentFromMediaUrl);
+
+/**
+ * @route POST /api/v1/assessmentGenerate/document-url
+ * @desc Generate assessment from document URL (PDF/PPT)
+ * @access Private
+ */
+router.post("/document-url", verifyJWT, generateAssessmentFromDocumentUrl);
 
 /**
  * @route GET /api/v1/assessmentGenerate/upload-help
